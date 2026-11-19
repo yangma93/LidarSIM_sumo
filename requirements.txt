@@ -1,0 +1,27 @@
+# LidarSIM / SUMO co-simulation dependencies
+# Install with: pip install -r requirements.txt
+# Python >= 3.10 is required.
+
+# ---- Core (required) ----
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+PyQt6>=6.4
+pyqtgraph>=0.13
+open3d>=0.17
+
+# ---- Optional ----
+# HDF5 environment point clouds (.h5)
+h5py>=3.8
+
+# SUMO co-simulation (TraCI). Eclipse SUMO itself must be installed separately.
+# eclipse-sumo>=1.19
+
+# GPU acceleration (strongly recommended). Choose the wheel matching `nvidia-smi`:
+#   CUDA 12.x:  cupy-cuda12x>=12.0
+#   CUDA 11.x:  cupy-cuda11x>=11.0
+# Without CuPy the simulator falls back to CPU automatically.
+# cupy-cuda12x>=12.0
+
+# ---- Packaging (optional) ----
+# pyinstaller>=5.13

@@ -1,0 +1,40 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Experiment artefacts and local data
+Results/
+data/
+output/
+figures/
+build_assets/
+*.log
+*.csv
+*.npz
+*.ply
+*.h5
+*.pth
+*.pt
+
+# Local caches
+.cupy_cache/
+.cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lidarsim-sumo"
+version = "0.1.0"
+description = "Multi-LiDAR point-cloud simulation, SUMO co-simulation and cooperative-perception evaluation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "LidarSIM Authors" }]
+keywords = [
+  "lidar simulation",
+  "roadside lidar",
+  "cooperative perception",
+  "vehicle-road cooperation",
+  "sumo",
+  "point cloud",
+  "autonomous driving",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "matplotlib>=3.7",
+  "PyQt6>=6.4",
+  "pyqtgraph>=0.13",
+  "open3d>=0.17",
+  "h5py>=3.8",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x>=12.0"]
+sumo = ["eclipse-sumo>=1.19"]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/<your-org>/LidarSIM_sumo"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["gui", "gui_cav_config", "gui_roadnet", "gui_sumo", "simulate"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
