@@ -226,7 +226,8 @@ def export_opencood(sim, i1: int, i2: int, out_root: str,
         # CAV: 云按 name 匹配, 位姿取该帧车辆位姿
         clouds_by_name = {c.lidar_name: c for c in clouds[len(sim.lidars):]}
         for aid, cav in cavs:
-            cloud = clouds_by_name.get(f"{cav.spec.name}@cav{cav.vid}")
+            cloud = clouds_by_name.get(
+                f"{cav.spec.name}{getattr(cav, 'tag', '')}@cav{cav.vid}")
             veh = next((v for v in scene.vehicles if v.vid == cav.vid), None)
             if cloud is None or len(cloud.xyz) == 0 or veh is None:
                 skipped.setdefault(aid, []).append(i)
@@ -236,8 +237,14 @@ def export_opencood(sim, i1: int, i2: int, out_root: str,
             write_pcd_binary(os.path.join(adir, frame_id + ".pcd"),
                              cloud.xyz, cloud.intensity)
             pos, yaw = veh.pose_at(np.array([t]))
-            pose = [float(pos[0, 0]), float(pos[0, 1]),
-                    float(pos[0, 2] + veh.height + cav.height_offset),
+            if getattr(cav, "local_pos", None) is not None:
+                lx, ly, lz = [float(v) for v in cav.local_pos]
+            else:
+                lx, ly, lz = 0.0, 0.0, float(veh.height) + float(cav.height_offset)
+            c0, s0 = float(np.cos(yaw[0])), float(np.sin(yaw[0]))
+            pose = [float(pos[0, 0] + lx * c0 - ly * s0),
+                    float(pos[0, 1] + lx * s0 + ly * c0),
+                    float(pos[0, 2] + lz),
                     0.0, float(yaw[0]), 0.0]
             _write_yaml(adir, frame_id, pose, gt, 0.0)
             written[aid] += 1

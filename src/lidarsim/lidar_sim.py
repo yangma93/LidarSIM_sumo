@@ -10,6 +10,7 @@ from .raycast import EnvGrid, get_xp, ray_aabb_one, raycast_vehicle
 from .scene import SceneBuilder, SceneFrame
 from .weather import WeatherConfig, generate_clutter
 from .cav import CavLidar
+from .semantics import object_semantic_class, foreground_base
 
 
 @dataclass
@@ -27,6 +28,8 @@ class SimCloud:
     label: np.ndarray        # (N,) int 0=环境, >0=车辆 vid (真值关联)
     t_beam: np.ndarray       # (N,) 光束帧内相对时刻
     range_m: np.ndarray      # (N,)
+    semantics: np.ndarray = None   # (N,) int 语义类别 (None=未启用)
+    semantic_base: int = 0         # 前景目标语义编码基址 (自适应背景编码)
 
 
 def compute_intensity(ranges, cos_inc, refl, spec: LidarSpec, rng,
@@ -57,11 +60,21 @@ def scan_phase(t: float) -> float:
 
 class LidarSimulator:
     def __init__(self, builder: SceneBuilder, lidars: list[LidarPose],
-                 params: SimParams = None, cav_lidars: list[CavLidar] = None):
+                 params: SimParams = None, cav_lidars: list[CavLidar] = None,
+                 semantics: bool = False):
         self.builder = builder
         self.lidars = lidars
         self.cav_lidars = cav_lidars or []
         self.params = params or SimParams()
+        # 点云语义: 环境点继承背景点云语义 (无则 0); 前景目标编码基址按背景
+        # 标签自适应 (max(100, 背景最大类别+1)), 保证与任意数据集编码不重叠
+        self.semantics = bool(semantics)
+        env_sem = getattr(builder.env_sim, "semantics", None)
+        self.env_sem_np = (np.asarray(env_sem, np.int32)
+                           if env_sem is not None
+                           and len(env_sem) == len(builder.env_sim.points)
+                           else None)
+        self.sem_fg_base = foreground_base(self.env_sem_np)
         self.xp, self.gpu = get_xp(self.params.device)
         xp = self.xp
         self.grid = EnvGrid(builder.env_sim.points, self.params.grid_cell, xp, self.gpu)
@@ -82,9 +95,10 @@ class LidarSimulator:
         # 路侧雷达位姿/扫描方向固定, 环境点云不变 -> 环境命中深度图每帧相同, 可复用.
         # CAV 位姿逐帧变化, 不进入该缓存.
         self._env_cache: dict[int, tuple] = {}
-        # CAV 上一帧环境深度图 (逐束): vid -> {"t_env", "o", "d"}
-        # 用于下一帧的环境求交上界 (静态环境下最近命中不会显著变远).
-        self._cav_state: dict[int, dict] = {}
+        # CAV 上一帧环境深度图 (逐束): (vid, tag) -> {"t_env", "o", "d"}
+        # 同一车辆可能装多个雷达, 必须按传感器区分, 否则会拿另一雷达的深度图
+        # 当本帧求交上界 (启用 cav_cap_enable 时会漏检).
+        self._cav_state: dict[tuple, dict] = {}
         # 传感器净空检查: 位姿嵌入遮挡物时给出警告 (视线将被拦截)
         for lp in lidars:
             near = self.grid.points_in_cell(np.asarray(lp.pose[:3], np.float64))
@@ -142,36 +156,66 @@ class LidarSimulator:
     # ------------------------------------------------------------------
     # 车端雷达: 多 CAV 合批
     # ------------------------------------------------------------------
-    def _cav_rays(self, cav: CavLidar, veh, t: float):
+    def _cav_pattern(self, spec: LidarSpec, roll: float, yaw_s: float,
+                     pitch: float, t: float, frame_cache: dict):
+        """传感器体坐标系下的基准扫描方向 (零位移, 含安装姿态).
+
+        旋转/转镜雷达的光束图案与帧无关 -> 实例级缓存;
+        非重复扫描随黄金比例相位逐帧漂移 -> 帧内缓存. 同一帧内所有型号与
+        安装姿态相同的传感器 (不管装在哪辆车上) 共用一份图案, 多车多雷达
+        时不再重复生成数万条光束.
+        """
+        key = (spec.channels, spec.vfov_min_deg, spec.vfov_max_deg,
+               spec.fov_h_deg, spec.h_res_deg, spec.scan_mode,
+               int(spec.points_per_sec),
+               round(roll, 6), round(yaw_s, 6), round(pitch, 6))
+        att = [0.0, 0.0, 0.0, roll, yaw_s, pitch]
+        if spec.scan_mode != "rotary":
+            ph = round(scan_phase(t), 9)
+            fkey = key + (ph,)
+            pat = frame_cache.get(fkey)
+            if pat is None:
+                _, d0, tf_np = scan_pattern(spec, att, phase=ph)
+                pat = (d0, tf_np)
+                frame_cache[fkey] = pat
+            return pat
+        pat = self._zero_pat_cache.get(key)
+        if pat is None:
+            _, d0, tf_np = scan_pattern(spec, att)
+            pat = (d0, tf_np)
+            self._zero_pat_cache[key] = pat
+        return pat
+
+    def _cav_rays(self, cav: CavLidar, veh, t: float, pat_cache: dict,
+                  pose_cache: dict):
         """单 CAV 一帧光线 (逐光束位姿插值 -> 运动伪影).
 
         返回 (o_np, d_np, tf_np, origin, beam_abs_t, scan_T).
         ``local_pos`` 指定车辆坐标系安装点; ``local_attitude`` 为传感器
         相对车体的姿态, 与旋转扫描/非重复扫描使用完全相同的求交与强度逻辑.
+
+        ``pat_cache`` / ``pose_cache`` 为帧内共享缓存: 同一车辆上扫描周期相同
+        的多个传感器共享一份逐光束位姿插值结果 (veh.pose_at), 避免对同一批
+        光束时刻反复插值.
         """
         spec = cav.spec
         scan_T = 1.0 / spec.rate_hz
         roll, pitch, yaw_s = [float(v) for v in (cav.local_attitude or (0, 0, 0))]
-        att = [0.0, 0.0, 0.0, roll, yaw_s, pitch]
-        if spec.scan_mode != "rotary":
-            _, d0, tf_np = scan_pattern(spec, att, phase=scan_phase(t))
-        else:
-            # 传感器体坐标系下的基准扫描 (零位移, 含安装姿态) 按 spec+姿态缓存
-            key = (spec.channels, spec.vfov_min_deg, spec.vfov_max_deg,
-                   spec.fov_h_deg, spec.h_res_deg, spec.scan_mode,
-                   round(roll, 6), round(yaw_s, 6), round(pitch, 6))
-            pat = self._zero_pat_cache.get(key)
-            if pat is None:
-                _, d0, tf_np = scan_pattern(spec, att)
-                pat = (d0, tf_np)
-                self._zero_pat_cache[key] = pat
-            d0, tf_np = pat
-        beam_t = t + tf_np.astype(np.float64) * scan_T
-        pos, yaw = veh.pose_at(beam_t)               # (R,3) 逐光束位姿
+        d0, tf_np = self._cav_pattern(spec, roll, yaw_s, pitch, t, pat_cache)
         if cav.local_pos is not None:
             lx, ly, lz = [float(v) for v in cav.local_pos]
         else:
             lx, ly, lz = 0.0, 0.0, float(veh.height) + float(cav.height_offset)
+        # 同一车辆 + 同一光束时序 -> 位姿插值结果可复用
+        pkey = (int(veh.vid), round(scan_T, 9), id(tf_np))
+        cached = pose_cache.get(pkey)
+        if cached is None:
+            beam_t = t + tf_np.astype(np.float64) * scan_T
+            pos, yaw = veh.pose_at(beam_t)           # (R,3) 逐光束位姿
+            p0, y0 = veh.pose_at(np.array([t]))      # 帧起始位姿 (输出原点)
+            cached = (beam_t, pos, yaw, p0, y0)
+            pose_cache[pkey] = cached
+        beam_t, pos, yaw, p0, y0 = cached
         cy, sy = np.cos(yaw), np.sin(yaw)            # 车载: 车辆 yaw
         ox = pos[:, 0] + lx * cy - ly * sy
         oy = pos[:, 1] + lx * sy + ly * cy
@@ -180,8 +224,6 @@ class LidarSimulator:
         d_np = np.stack([d0[:, 0] * cy - d0[:, 1] * sy,
                          d0[:, 0] * sy + d0[:, 1] * cy,
                          d0[:, 2]], 1).astype(np.float32)
-        # 输出原点取帧起始时刻位姿
-        p0, y0 = veh.pose_at(np.array([t]))
         cy0, sy0 = float(np.cos(y0[0])), float(np.sin(y0[0]))
         origin = np.array([p0[0, 0] + lx * cy0 - ly * sy0,
                            p0[0, 1] + lx * sy0 + ly * cy0,
@@ -199,7 +241,7 @@ class LidarSimulator:
         spec = cav.spec
         R = len(o_np)
         full = np.full(R, spec.range_max, np.float32)
-        st = self._cav_state.get(cav.vid)
+        st = self._cav_state.get(cav.key)
         if not getattr(self.params, "cav_cap_enable", False) or st is None \
                 or len(st["t_env"]) != R:
             return full
@@ -222,11 +264,13 @@ class LidarSimulator:
         小 kernel 提交次数与 AABB 候选矩阵的重复构建.
         """
         entries = []
+        pat_cache, pose_cache = {}, {}
         for cav in cavs:
             veh = next((v for v in scene.vehicles if v.vid == cav.vid), None)
             if veh is None:
                 continue                    # 该帧车辆未激活
-            o_np, d_np, tf_np, origin, beam_t, scan_T = self._cav_rays(cav, veh, t)
+            o_np, d_np, tf_np, origin, beam_t, scan_T = self._cav_rays(
+                cav, veh, t, pat_cache, pose_cache)
             entries.append((cav, o_np, d_np, tf_np, origin, beam_t, scan_T))
         if not entries:
             self._cav_state.clear()
@@ -265,23 +309,31 @@ class LidarSimulator:
             R = len(o_np)
             sl = slice(off, off + R)
             off += R
-            # 帧末记录环境深度图, 供下一帧 t_max 上界使用
-            state[cav.vid] = {"t_env": np.array(t_env_np[sl], np.float32),
+            # 帧末记录环境深度图, 供下一帧 t_max 上界使用 (按传感器而非车辆区分,
+            # 同一车辆多个雷达各自维护自己的深度图)
+            state[cav.key] = {"t_env": np.array(t_env_np[sl], np.float32),
                               "o": o_np, "d": d_np}
+            name = (f"{cav.spec.name}{cav.tag}@cav{cav.vid}")
             cloud = self._finalize_pattern(
-                scene, cav.spec, f"{cav.spec.name}@cav{cav.vid}", tf_np, origin,
+                scene, cav.spec, name, tf_np, origin,
                 o_np, d_np, t_env[sl], pt_idx[sl],
                 veh_t[sl], veh_slot[sl], veh_tri[sl], veh_yaw[sl])
-            # 自车体回波 (label == 自身 vid 且距离过近) 会污染 L-shape 拟合与 IoU
-            # 评估, 予以剔除; 其他个体对该车的回波保持不变.
+            # 自车体回波: 车端雷达只可能打到自己车身 (label == 自身 vid), 这些都是
+            # 遮挡回波而非目标. 旧实现只剔除 range < self_clear 的近场部分, 大型车
+            # (卡车/客车) 或偏置安装的传感器会把远处的自身车厢留在点云里, 污染
+            # L-shape 拟合与 IoU; 这里按标签整体剔除.
+            # 注意 label==0 表示环境点 (vid 也可以从 0 开始), 必须用 label>0 限定,
+            # 否则 vid=0 的 CAV 会把整片环境点误删.
             if len(cloud.xyz):
-                keep = ~((cloud.label == cav.vid) & (cloud.range_m < cav.self_clear))
+                keep = ~((cloud.label == cav.vid) & (cloud.label > 0))
                 if not keep.all():
                     cloud.xyz = cloud.xyz[keep]
                     cloud.intensity = cloud.intensity[keep]
                     cloud.label = cloud.label[keep]
                     cloud.t_beam = cloud.t_beam[keep]
                     cloud.range_m = cloud.range_m[keep]
+                    if cloud.semantics is not None:
+                        cloud.semantics = cloud.semantics[keep]
             clouds.append(cloud)
         self._cav_state = state
         return clouds
@@ -399,7 +451,9 @@ class LidarSimulator:
             cloud = SimCloud(name, origin,
                              np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
                              np.zeros(0, np.int64), np.zeros(0, np.float32),
-                             np.zeros(0, np.float32))
+                             np.zeros(0, np.float32),
+                             np.zeros(0, np.int32) if self.semantics else None,
+                             self.sem_fg_base if self.semantics else 0)
             if w_on:   # 即使无真实命中, 降水杂波仍可能存在
                 r_full = (xp.asnumpy(t_hit) if self.gpu else t_hit).astype(np.float64)
                 cl = generate_clutter(wcfg, spec, o_np, d_np, tf_np, r_full, self.rng)
@@ -460,6 +514,16 @@ class LidarSimulator:
         label = np.where(ec_np, 0,
                          np.array([vehicles[int(s)].vid if s >= 0 else 0
                                    for s in slot_np], np.int64))
+        # ---- 5b) 语义类别: 背景继承环境点云语义, 前景按车型对象属性编码 ----
+        sem = None
+        if self.semantics:
+            sem = np.zeros(n, np.int32)          # 背景无语义时默认 0 (unlabeled)
+            if em.any() and self.env_sem_np is not None:
+                sem[em] = self.env_sem_np[pt_np[em]]
+            for s in np.unique(slot_np[vm]):
+                veh = vehicles[int(s)]
+                sem[vm & (slot_np == s)] = object_semantic_class(
+                    getattr(veh, "cls", ""), self.sem_fg_base)
         cloud = SimCloud(
             lidar_name=name,
             origin=origin,
@@ -467,7 +531,9 @@ class LidarSimulator:
             intensity=inten[keep],
             label=label[keep],
             t_beam=tf_np[idx_np][keep].astype(np.float32),
-            range_m=th_np[keep].astype(np.float32))
+            range_m=th_np[keep].astype(np.float32),
+            semantics=(sem[keep] if sem is not None else None),
+            semantic_base=(self.sem_fg_base if self.semantics else 0))
         # ---- 6) 雨/雪杂波 (label=-1) ----
         if w_on:
             r_full = (xp.asnumpy(t_hit) if self.gpu else t_hit).astype(np.float64)
@@ -485,6 +551,10 @@ class LidarSimulator:
             [cloud.label, np.full(len(cx), -1, np.int64)])
         cloud.t_beam = np.concatenate([cloud.t_beam, ct])
         cloud.range_m = np.concatenate([cloud.range_m, cr])
+        if cloud.semantics is not None:
+            # 天气杂波不属于背景环境也不是前景目标 -> 未标注
+            cloud.semantics = np.concatenate(
+                [cloud.semantics, np.zeros(len(cx), np.int32)])
         return cloud
 
     # ------------------------------------------------------------------

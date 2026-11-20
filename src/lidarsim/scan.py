@@ -62,11 +62,18 @@ def scan_pattern(spec: LidarSpec, pose, phase: float = 0.0):
     ct = np.cos(EL)
     dirs = np.stack([ct * np.cos(AZ), ct * np.sin(AZ), np.sin(EL)], -1).reshape(-1, 3)
     dirs_w = dirs @ R_l.T
-    # 光束时刻: 方位角在扫描周期内线性推进
+    # 光束时刻: 方位角在扫描周期内线性推进.
+    # 扇形雷达 (fov_h_deg < 360) 的方位列原本从 -FOV/2 起算, 直接除以 FOV 会得到
+    # [-0.5, 0.5) 的负时刻 —— 一半光束的位姿被外推/钳制到帧起点, rolling shutter
+    # (运动伪影) 失效, t_beam 也不再满足 [0,1) 的约定. 这里平移到 [0,1).
     if spec.fov_h_deg < 360:
-        t_frac = (AZ[:, 0] / (spec.fov_h_deg * np.pi / 180)).repeat(spec.channels)
+        t_frac_col = (AZ[:, 0] + 0.5 * (spec.fov_h_deg * np.pi / 180)) / \
+            (spec.fov_h_deg * np.pi / 180)
     else:
-        t_frac = (az_r / (2 * np.pi)).repeat(spec.channels)
+        t_frac_col = az_r / (2 * np.pi)
+    t_frac = np.repeat(t_frac_col, spec.channels)
+    # float32 舍入可能把最后一列推到 1.0 (与下一帧首列同一时刻), 兜底压回 [0,1)
+    t_frac = np.clip(t_frac, 0.0, np.nextafter(1.0, 0.0))
     origins = np.broadcast_to(origin, dirs_w.shape).copy()
     return (origins.astype(np.float32), dirs_w.astype(np.float32),
             np.ascontiguousarray(t_frac, np.float32))

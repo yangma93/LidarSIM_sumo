@@ -57,11 +57,18 @@ class CavTypeConfig:
     penetration: float = 0.1
     sensors: list = field(default_factory=list)
 
-    def ensure_sensors(self, n: int):
+    def ensure_sensors(self, n: int, preset: str = None):
+        """调整传感器数量.
+
+        ``preset`` 为新传感器继承的型号: 未指定时沿用最后一个传感器的型号
+        (而不是一律 vlp16) —— 否则"再加一个 Livox"会悄悄变成 vlp16, 与用户
+        在界面上的配置意图不符.
+        """
         n = max(1, int(n))
+        base = preset or (self.sensors[-1].preset if self.sensors else "vlp16")
+        z = default_sensor_height(self.vtype)
         while len(self.sensors) < n:
-            self.sensors.append(CavSensor(
-                preset="vlp16", z=default_sensor_height(self.vtype)))
+            self.sensors.append(CavSensor(preset=base, z=z))
         del self.sensors[n:]
 
     def copy(self) -> "CavTypeConfig":
@@ -88,9 +95,15 @@ class CavComplexConfig:
         while len(self.types) < n:
             cls = next((c for c in VEHICLE_CLASSES if c not in used), "car")
             used.append(cls)
+            # 新车型继承上一种车型的传感器组合与渗透率, 避免"加了一个车型又
+            # 回到单个 vlp16"; 用户可在界面上再按车型改成不同雷达.
+            src = self.types[-1] if self.types else None
+            sensors = ([s.copy() for s in src.sensors] if src and src.sensors
+                       else [CavSensor(preset="vlp16",
+                                       z=default_sensor_height(cls))])
             self.types.append(CavTypeConfig(
-                vtype=cls, penetration=0.1,
-                sensors=[CavSensor(preset="vlp16", z=default_sensor_height(cls))]))
+                vtype=cls, penetration=(src.penetration if src else 0.1),
+                sensors=sensors))
         del self.types[n:]
 
     def type_for(self, vtype: str):
@@ -100,30 +113,42 @@ class CavComplexConfig:
         return None
 
     # ---- 仿真接入 ----
-    def cav_lidars_for(self, vid, vtype: str, self_clear: float = 2.5,
-                       force: bool = False):
+    def lidars_for_type(self, vid, cfg: "CavTypeConfig", force: bool = False):
+        """按给定车型配置生成传感器列表 (不含车型/渗透率判定).
+
+        多传感器时附加 ``tag`` (#1/#2...), 使输出点云名
+        ``livox_horizon#2@cav12`` 能区分同车的不同雷达, 便于联仿反馈与排查.
+        """
+        if cfg is None or not cfg.sensors:
+            return []
+        force = bool(force)
+        if not force and hash01(vid) >= float(np_clip(cfg.penetration)):
+            return []
+        multi = len(cfg.sensors) > 1
+        out = []
+        for i, s in enumerate(cfg.sensors):
+            out.append(CavLidar(
+                spec=make_spec(s.preset), vid=int(vid),
+                height_offset=0.0,
+                local_pos=s.pose_local(),
+                local_attitude=s.attitude_rad(),
+                tag=(f"#{i + 1}" if multi else "")))
+        return out
+
+    def cav_lidars_for(self, vid, vtype: str, force: bool = False):
         """按车型渗透率决定该个体是否配置车端雷达, 返回 CavLidar 列表."""
         if not self.enabled:
             return []
-        cfg = self.type_for(vtype)
-        if cfg is None or not cfg.sensors:
-            return []
-        if not force and hash01(vid) >= float(np_clip(cfg.penetration)):
-            return []
-        out = []
-        for s in cfg.sensors:
-            out.append(CavLidar(
-                spec=make_spec(s.preset), vid=int(vid),
-                height_offset=0.0, self_clear=float(self_clear),
-                local_pos=s.pose_local(), local_attitude=s.attitude_rad()))
-        return out
+        return self.lidars_for_type(vid, self.type_for(vtype), force=force)
 
     def summary(self) -> str:
+        """状态栏/按钮旁的一行摘要 (含型号, 便于确认复杂配置是否真的生效)."""
         if not self.enabled:
             return "未启用"
         items = []
         for t in self.types:
-            items.append(f"{t.vtype} {t.penetration:.2f}×{len(t.sensors)}")
+            models = "+".join(dict.fromkeys(s.preset for s in t.sensors))
+            items.append(f"{t.vtype} {t.penetration:.2f}×{len(t.sensors)}({models})")
         return "启用: " + ", ".join(items)
 
     # ---- 序列化 (SUMO 联仿线程) ----

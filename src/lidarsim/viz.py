@@ -48,19 +48,65 @@ SEMANTIC_COLORS = np.array([
 ], np.float32)
 
 
-def semantic_rgba(semantics, alpha: float = 1.0) -> np.ndarray:
+# 前景目标语义色 (按类别顺序, 编码 = 基址 + 1 + index; 基址随背景编码自适应)
+OBJECT_PALETTE = np.array([
+    [0.90, 0.25, 0.20],   # car
+    [0.95, 0.55, 0.15],   # suv
+    [0.95, 0.78, 0.20],   # van
+    [0.62, 0.35, 0.85],   # truck
+    [0.20, 0.55, 0.95],   # bus
+    [0.10, 0.80, 0.60],   # cyclist
+    [0.95, 0.35, 0.70],   # ped
+    [0.55, 0.55, 0.60],   # other
+], np.float32)
+
+
+def _distinct_colors(n: int) -> np.ndarray:
+    """按黄金角生成 n 个可区分颜色 (背景类别数超过固定调色板时使用)."""
+    h = (np.arange(n, dtype=np.float64) * 0.618033988749895) % 1.0
+    s = np.full(n, 0.62)
+    v = np.full(n, 0.95)
+    i = np.floor(h * 6.0)
+    fr = h * 6.0 - i
+    p, q, t = v * (1 - s), v * (1 - s * fr), v * (1 - s * (1 - fr))
+    i = i.astype(np.int64) % 6
+    rgb = np.empty((n, 3), np.float64)
+    for k, (r, g, b) in enumerate([(v, t, p), (q, v, p), (p, v, t),
+                                   (p, q, v), (t, p, v), (v, p, q)]):
+        m = i == k
+        if m.any():
+            rgb[m, 0] = r[m] if np.ndim(r) else r
+            rgb[m, 1] = g[m] if np.ndim(g) else g
+            rgb[m, 2] = b[m] if np.ndim(b) else b
+    return rgb.astype(np.float32)
+
+
+def semantic_rgba(semantics, fg_base: int = None, alpha: float = 1.0) -> np.ndarray:
     """语义类别 -> RGBA (N,4) float32.
 
-    0 / 负值视为未标注; 超出调色板长度的类别按循环取色, 保证任意数据集可用.
+    ``fg_base`` 为前景目标编码基址 (仿真点云使用 SimCloud.semantic_base);
+    小于基址的非零类别是背景, 原样按背景调色板着色, 类别数超过固定调色板
+    时自动生成可区分颜色. ``fg_base=None`` 表示全部按背景着色 (静态环境点云).
     """
     sem = np.asarray(semantics).astype(np.int64).ravel()
-    n = len(SEMANTIC_COLORS)
-    idx = np.zeros(len(sem), np.int64)
-    pos = sem > 0
-    idx[pos] = (sem[pos] - 1) % (n - 1) + 1
     out = np.ones((len(sem), 4), np.float32)
     out[:, 3] = float(alpha)
-    out[:, :3] = SEMANTIC_COLORS[idx]
+    out[:, :3] = SEMANTIC_COLORS[0]
+    base = None if fg_base is None else int(fg_base)
+    fg = (sem >= base) if base is not None else np.zeros(len(sem), bool)
+    bg = (sem > 0) & ~fg
+    if bg.any():
+        codes = np.unique(sem[bg])
+        n_pal = len(SEMANTIC_COLORS) - 1
+        if len(codes) <= n_pal and codes.min() >= 1 and codes.max() <= n_pal:
+            out[bg, :3] = SEMANTIC_COLORS[sem[bg]]
+        else:
+            lut = dict(zip(codes.tolist(), _distinct_colors(len(codes))))
+            for code, col in lut.items():
+                out[sem == code, :3] = col
+    if fg.any():
+        idx = np.clip(sem[fg] - base - 1, 0, len(OBJECT_PALETTE) - 1)
+        out[fg, :3] = OBJECT_PALETTE[idx]
     return out
 
 
@@ -254,6 +300,9 @@ def save_clouds_npz(clouds, path: str):
         out[p + "label"] = c.label
         out[p + "t_beam"] = c.t_beam
         out[p + "origin"] = c.origin
+        sem = getattr(c, "semantics", None)
+        if sem is not None:
+            out[p + "semantics"] = np.asarray(sem, np.int32)
     np.savez_compressed(path, **out)
 
 
@@ -280,9 +329,11 @@ def save_clouds_ply(clouds, path: str):
 
     逐点属性: x y z (float), intensity (float), label (int32: 0=环境,
     -1=天气杂波, >0=车辆vid), lidar_id (int32), red green blue (uchar,
-    按类别着色: 环境灰 / 天气蓝灰 / 车辆按 vid 取色).
+    按类别着色: 环境灰 / 天气蓝灰 / 车辆按 vid 取色). 启用语义时额外写
+    ``semantic`` (int32: 背景继承 + 前景 100+ 编码).
     """
-    pts_l, inten_l, label_l, lidar_l, rgb_l = [], [], [], [], []
+    pts_l, inten_l, label_l, lidar_l, rgb_l, sem_l = [], [], [], [], [], []
+    has_sem = any(getattr(c, "semantics", None) is not None for c in clouds)
     for i, c in enumerate(clouds):
         n = len(c.xyz)
         if n == 0:
@@ -292,6 +343,10 @@ def save_clouds_ply(clouds, path: str):
         lab = np.asarray(c.label, np.int32)
         label_l.append(lab)
         lidar_l.append(np.full(n, i, np.int32))
+        sem = getattr(c, "semantics", None)
+        if has_sem:
+            sem_l.append(np.asarray(sem, np.int32) if sem is not None
+                         else np.zeros(n, np.int32))
         rgb = np.zeros((n, 3), np.uint8)
         rgb[lab == 0] = (150, 150, 150)
         rgb[lab < 0] = (140, 170, 230)               # 天气杂波
@@ -310,12 +365,16 @@ def save_clouds_ply(clouds, path: str):
     dtype = [("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
              ("intensity", "<f4"), ("label", "<i4"), ("lidar_id", "<i4"),
              ("red", "u1"), ("green", "u1"), ("blue", "u1")]
+    if has_sem:
+        dtype.append(("semantic", "<i4"))
     arr = np.empty(n, dtype=dtype)
     arr["x"], arr["y"], arr["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
     arr["intensity"] = inten
     arr["label"] = label
     arr["lidar_id"] = lidar_id
     arr["red"], arr["green"], arr["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    if has_sem:
+        arr["semantic"] = np.concatenate(sem_l)
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
@@ -326,6 +385,7 @@ def save_clouds_ply(clouds, path: str):
         "property int label\n"
         "property int lidar_id\n"
         "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        + ("property int semantic\n" if has_sem else "") +
         "end_header\n")
     with open(path, "wb") as f:
         f.write(header.encode("ascii"))

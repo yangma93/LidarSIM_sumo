@@ -7,13 +7,20 @@ import numpy as np
 from .pointcloud import EnvCloud, GroundModel, estimate_normals
 from .trajectory import Trajectories, Track
 from .meshes import ModelLibrary, Mesh
+from .semantics import vehicle_class
 
 
-def voxel_downsample(points: np.ndarray, voxel: float, values: list[np.ndarray] = None):
-    """体素降采样, values 为逐点标量属性 (体素内取均值)."""
+def voxel_downsample(points: np.ndarray, voxel: float, values: list[np.ndarray] = None,
+                     return_index: bool = False):
+    """体素降采样, values 为逐点标量属性 (体素内取均值).
+
+    ``return_index=True`` 时额外返回每个体素代表点的原始索引 (体素内首点),
+    用于让离散属性 (如语义类别) 与降采样后的点一一对齐.
+    """
     ij = np.floor(points / voxel).astype(np.int64)
     key = np.stack([ij[:, 0], ij[:, 1], ij[:, 2]], 1)
-    uniq, inv = np.unique(key, axis=0, return_inverse=True)
+    uniq, idx, inv = np.unique(key, axis=0, return_index=True,
+                               return_inverse=True)
     center = (uniq + 0.5) * voxel
     out = [center.astype(np.float32)]
     inv64 = inv.astype(np.int64)
@@ -21,6 +28,8 @@ def voxel_downsample(points: np.ndarray, voxel: float, values: list[np.ndarray] 
     for v in (values or []):
         s = np.bincount(inv64, v.astype(np.float64), minlength=len(uniq))
         out.append((s / cnt).astype(np.float32))
+    if return_index:
+        return out, idx
     return out
 
 
@@ -37,6 +46,7 @@ class VehicleInstance:
     height: float
     refl: float
     ground_fn: object = None   # callable(xy (m,2)) -> (m,) 地面高程
+    cls: str = "car"           # 车型类别 (car/suv/van/truck/bus/cyclist/ped), 语义编码用
 
     def obb(self) -> np.ndarray:
         """真值 OBB 8 角点 (8,3)."""
@@ -79,13 +89,18 @@ class SceneBuilder:
         self.ground = GroundModel(env.points, cell=ground_cell, pctl=ground_pctl)
         self.ground_tol = ground_tol
         # 仿真用环境: 体素降采样 + 反射率均值 + 法向
-        pts, refl = voxel_downsample(
+        (pts, refl), vidx = voxel_downsample(
             env.points, env_voxel,
             [env.reflectance if env.reflectance is not None
-             else np.full(len(env.points), 0.2, np.float32)])
+             else np.full(len(env.points), 0.2, np.float32)],
+            return_index=True)
         normals = estimate_normals(pts, normal_voxel)
+        # 语义类别按体素代表点继承 (离散属性不能取均值), 保证与降采样点对齐
+        sem_sim = None
+        if env.semantics is not None and len(env.semantics) == len(env.points):
+            sem_sim = np.asarray(env.semantics)[vidx].astype(np.int32)
         self.env_sim = EnvCloud(points=pts, reflectance=refl, normals=normals,
-                                semantics=env.semantics, rgb=env.rgb)
+                                semantics=sem_sim, rgb=env.rgb)
         self.env_full = env
         # vType -> 网格
         vmap = models.match_vtypes(traj.vtype_dims())
@@ -116,7 +131,8 @@ class SceneBuilder:
                 vid=v, vtype=tr.vtype, track=tr, mesh=mesh,
                 pos=np.array([pos2[0], pos2[1], gz]), yaw=float(yaw[0]),
                 length=float(tr.length()), width=tr.width, height=float(mesh.dims[2]),
-                refl=mesh.refl, ground_fn=self.ground.height)
+                refl=mesh.refl, ground_fn=self.ground.height,
+                cls=vehicle_class(self.traj, tr.vtype, mesh.name))
             vehicles.append(veh)
         return SceneFrame(t=t, env=self.env_sim, env_viz=None, vehicles=vehicles)
 

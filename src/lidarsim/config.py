@@ -79,9 +79,26 @@ LIDAR_PRESETS = {
 }
 
 
+def normalize_preset(preset) -> str:
+    """把配置里的型号字符串规范化 (去空白 / 小写), 未知型号原样返回."""
+    return str(preset or "vlp16").strip().lower()
+
+
 def make_lidar(preset: str = "vlp16", **overrides) -> LidarSpec:
-    kw = dict(LIDAR_PRESETS.get(preset, LIDAR_PRESETS["vlp16"]))
+    """按预设名构造 LidarSpec.
+
+    型号名先做规范化 (strip + lower). 未知型号不再静默回退到 vlp16 —— 静默
+    回退会让"车端配了 Livox 却按 vlp16 仿真"这种问题完全无迹可寻, 这里给出
+    明确的告警行, 便于从 GUI/日志中定位配置错误.
+    """
+    key = normalize_preset(preset)
+    if key not in LIDAR_PRESETS:
+        print(f"[config] 未知雷达预设 '{preset}', 已回退 vlp16; "
+              f"可用预设: {', '.join(LIDAR_PRESETS)}")
+        key = "vlp16"
+    kw = dict(LIDAR_PRESETS[key])
     kw.update(overrides)
+    kw["name"] = overrides.get("name", key)
     return LidarSpec(**kw)
 
 

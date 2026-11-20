@@ -55,31 +55,116 @@ def _load_ply(path: str):
 
 
 def _load_h5(path: str):
+    """读取 H5 点云: 递归查找 (N,3) 坐标 + 强度 + 语义/实例标签.
+
+    不同数据集的键名与形状不同 (coords/points/xyz, semantics/labels/class,
+    1D 或 (N,1) 或 one-hot (N,C)), 这里做自适应识别.
+    """
     import h5py
 
-    def find(g, keys):
-        low = {k.lower(): k for k in g.keys()}
-        for k in keys:
-            if k in low:
-                return g[low[k]][:]
-        return None
-
     with h5py.File(path, "r") as f:
-        pts = find(f, ["coords", "points", "xyz", "pos"])
-        if pts is None:  # 深度搜索
-            def walk(name, obj):
-                global _hit
-                pass
-            for k in f:
-                if isinstance(f[k], h5py.Dataset) and f[k].ndim == 2 and f[k].shape[1] == 3:
-                    pts = f[k][:]
+        items = []
+
+        def visit(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                items.append((name, obj.shape, obj.dtype, obj))
+
+        f.visititems(visit)
+
+        def find(keys, ndim=None, cols=None):
+            cands = []
+            for name, shape, dtype, ds in items:
+                base = name.rsplit("/", 1)[-1].lower()
+                if base in keys:
+                    cands.append((len(name), name, shape, ds))
+            cands.sort(key=lambda t: t[0])      # 优先浅层/短路径
+            for _, name, shape, ds in cands:
+                if ndim is not None and len(shape) != ndim:
+                    continue
+                if cols is not None and (len(shape) < 2 or shape[1] != cols):
+                    continue
+                return ds, name
+            return None, None
+
+        pts, pname = find(("coords", "points", "xyz", "pos"), ndim=2, cols=3)
+        if pts is None:                          # 任意 (N,3) 数据集
+            for name, shape, dtype, ds in items:
+                if len(shape) == 2 and shape[1] == 3:
+                    pts, pname = ds, name
                     break
         if pts is None:
             raise ValueError(f"H5 中未找到 (N,3) 坐标数据集: {path}")
-        inten = find(f, ["intensity", "reflectance", "intensities"])
-        sem = find(f, ["semantics", "semantic", "labels", "label"])
-        inst = find(f, ["instances", "instance", "instance_ids"])
-        return pts, inten, sem, inst
+        n = int(pts.shape[0])
+
+        def read_vec(ds):
+            a = ds[()]
+            if a.ndim == 2:
+                if a.shape[0] == n and a.shape[1] == 1:
+                    a = a[:, 0]
+                elif a.shape[1] == n:
+                    a = a.T
+                    a = a[:, 0]
+                elif a.shape[0] == n:
+                    a = np.argmax(a, 1)          # one-hot -> 类别索引
+            return np.asarray(a).ravel()
+
+        inten, _ = find(("intensity", "reflectance", "intensities"))
+        inten = read_vec(inten) if inten is not None and inten.shape[0] == n else None
+        if inten is not None and inten.size != n:
+            inten = None
+
+        # 语义标签: 名称自适应, 且必须与点数一致
+        sem, sname = None, ""
+        sem_keys = ("semantics", "semantic", "sem", "sem_label", "semantic_label",
+                    "semantic_id", "class", "classes", "class_id",
+                    "label", "labels", "seg", "segmentation", "seg_labels")
+        sem_ds, sname = find(sem_keys)
+        if sem_ds is not None:
+            try:
+                arr = read_vec(sem_ds).astype(np.int64)
+                if arr.size == n:
+                    sem = arr
+                else:
+                    sname = ""
+            except Exception:                                  # noqa: BLE001
+                sem, sname = None, ""
+
+        inst, _ = find(("instances", "instance", "instance_ids", "instance_id"))
+        inst = read_vec(inst) if inst is not None and inst.shape[0] == n else None
+        if inst is not None and inst.size != n:
+            inst = None
+        # 立即读出为 ndarray, 避免文件关闭后 h5py 数据集失效
+        return np.asarray(pts[()]), inten, sem, inst, pname, sname
+
+
+# PLY 语义属性名优先级 (instance 是实例 id, 不作为语义)
+_PLY_SEM_KEYS = ("semantic", "semantics", "sem_label", "semantic_label",
+                 "semantic_id", "class", "class_id", "classes",
+                 "label", "labels")
+
+
+def _ply_semantic_field(names):
+    low = {n.lower(): n for n in names}
+    for key in _PLY_SEM_KEYS:
+        if key in low:
+            return low[key]
+    for lname, real in low.items():
+        if "semantic" in lname:
+            return real
+    return None
+
+
+def _as_labels(values, n: int):
+    """任意数值类型 -> (n,) int32 语义标签; 长度不符返回 None."""
+    a = np.asarray(values).ravel()
+    if a.size != n:
+        return None
+    if a.dtype.kind == "f":
+        a = np.rint(np.nan_to_num(a, nan=0.0))
+    try:
+        return a.astype(np.int32)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -94,12 +179,14 @@ class EnvCloud:
 
 
 def load_env(path: str) -> EnvCloud:
+    """加载环境点云; 自适应识别不同数据集的语义标签编码 (PLY/H5)."""
     ext = path.lower().rsplit(".", 1)[-1]
     if ext == "ply":
         arr = _load_ply(path)
         xyz = np.stack([arr["x"], arr["y"], arr["z"]], 1).astype(np.float32)
         names = arr.dtype.names
-        sem = arr["semantic"].astype(np.int32) if "semantic" in names else None
+        sem_field = _ply_semantic_field(names)
+        sem = _as_labels(arr[sem_field], len(xyz)) if sem_field else None
         rgb = None
         if all(k in names for k in ("red", "green", "blue")):
             rgb = np.stack([arr["red"], arr["green"], arr["blue"]], 1).astype(np.uint8)
@@ -107,18 +194,23 @@ def load_env(path: str) -> EnvCloud:
         if rgb is not None:  # 灰度 -> 反射率 (沥青灰度~0.15 -> rho~0.15)
             gray = rgb.astype(np.float32).mean(1) / 255.0
             refl = np.clip(0.04 + 0.75 * gray, 0.04, 0.85).astype(np.float32)
+        extras = {k: arr[k] for k in names
+                  if k not in ("x", "y", "z", "red", "green", "blue")}
+        if sem is not None:
+            extras["semantic_field"] = sem_field
         return EnvCloud(points=xyz, reflectance=refl, semantics=sem, rgb=rgb,
-                        extras={k: arr[k] for k in names
-                                if k not in ("x", "y", "z", "red", "green", "blue")})
+                        extras=extras)
     elif ext == "h5":
-        pts, inten, sem, inst = _load_h5(path)
+        pts, inten, sem, inst, pname, sname = _load_h5(path)
         pts = pts.astype(np.float32)
         refl = None
         if inten is not None:
             refl = np.clip(inten.astype(np.float32) / 65535.0, 0.02, 0.95)
-        return EnvCloud(points=pts, reflectance=refl,
-                        semantics=sem.astype(np.int64) if sem is not None else None,
-                        extras={"instances": inst})
+        sem = _as_labels(sem, len(pts)) if sem is not None else None
+        extras = {"instances": inst, "points_field": pname}
+        if sem is not None:
+            extras["semantic_field"] = sname
+        return EnvCloud(points=pts, reflectance=refl, semantics=sem, extras=extras)
     raise ValueError(f"不支持的环境点云格式: {path} (支持 .ply / .h5)")
 
 

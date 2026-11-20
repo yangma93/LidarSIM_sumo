@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from .config import SimParams, make_lidar
-from .cav import CavLidar
+from .cav import CavLidar, class_from_label
 from .cav_config import CavComplexConfig, hash01
 from .meshes import class_of_mesh
 from .lidar_sim import LidarSimulator, LidarPose
@@ -82,6 +82,7 @@ class CosimConfig:
     show_gt: bool = False        # 三维可视化绘制 GT BBox
     show_det: bool = True        # 三维可视化绘制感知 (拟合) BBox
     cav_complex: dict = field(default_factory=dict)   # CAV 复杂配置 (CavComplexConfig.to_dict)
+    semantics: bool = False       # 仿真点云附带语义类别 (主界面“获取点云语义”)
     algo_params: dict = field(default_factory=dict)
 
 
@@ -376,6 +377,8 @@ class CosimSession:
         self.vtype_map: dict[str, int] = {}
         self.cav_cfg = CavComplexConfig.from_dict(self.cfg.cav_complex)
         self._last_status = None
+        # 上次上报的 CAV 车端雷达构成 (车数/传感器数/型号), 变化时才写日志
+        self._cav_sig = None
         # 上次写入 SUMO 的车辆颜色, 避免每步重复 setColor
         self._colors: dict[str, tuple] = {}
 
@@ -403,9 +406,11 @@ class CosimSession:
             normal_voxel=getattr(params, "normal_voxel", 0.25))
         lidars = [LidarPose(spec=make_lidar(p), pose=list(pose))
                   for p, pose in (self.cfg.lidars or [])]
-        self.sim = LidarSimulator(self.builder, lidars, params, cav_lidars=[])
+        self.sim = LidarSimulator(self.builder, lidars, params, cav_lidars=[],
+                                  semantics=bool(self.cfg.semantics))
         self.log(f"感知链路就绪: 路侧雷达 {len(lidars)} 个, "
-                 f"CAV 模式 {self.cfg.cav_mode}, 可视化 {'开' if self.cfg.viz else '关'}")
+                 f"CAV 模式 {self.cfg.cav_mode}, 语义 {'开' if self.cfg.semantics else '关'}, "
+                 f"可视化 {'开' if self.cfg.viz else '关'}")
 
     # ---- 坐标一致性检查 ----
     def _check_coordinate_space(self):
@@ -430,7 +435,14 @@ class CosimSession:
 
     # ---- CAV 选择 ----
     def _snap_class(self, s) -> str:
-        """按车辆外廓匹配网格, 推断车型类别 (用于复杂配置)."""
+        """推断车型类别 (用于复杂配置).
+
+        先看 SUMO 车型名 (vType, 如 bus/truck/passenger), 这是比外廓更可靠的
+        先验; 名称无法判断时再退回按外廓匹配网格.
+        """
+        cls = class_from_label(s.get("vtype"))
+        if cls:
+            return cls
         try:
             mesh = self.models.match(float(s["length"]), float(s["width"]))
             return class_of_mesh(mesh.name)
@@ -656,6 +668,19 @@ class CosimSession:
                                              vid=vid,
                                              height_offset=self.cfg.cav_height))
                 self.sim.set_cav_lidars(cavs)
+                # 车端雷达构成变化时报一次 (型号/传感器数), 便于确认复杂配置
+                # (多车型/多 Livox) 真的进入了联仿, 而不是仍在跑简单 vlp16.
+                sig = (len({c.vid for c in cavs}), len(cavs),
+                       tuple(sorted({c.spec.name for c in cavs})))
+                if sig != self._cav_sig:
+                    self._cav_sig = sig
+                    if cavs:
+                        n_veh, n_sen, models = sig
+                        report_log(f"CAV 车端雷达: {n_veh} 车 / {n_sen} 传感器 "
+                                   f"[{'+'.join(models)}]")
+                    elif cav_sids:
+                        report_log("CAV 复杂配置已启用, 但选中车辆没有匹配到任何"
+                                   "车型配置 (检查车型分类 / 渗透率)")
                 if colliding and colliding != last_collide:
                     report_log(f"SUMO 碰撞车辆: {colliding}")
                     last_collide = list(colliding)
