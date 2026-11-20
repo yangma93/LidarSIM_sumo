@@ -84,6 +84,8 @@ LidarSIM_sumo/
 ├── html/
 │   ├── index.html                 # Bilingual (中文 / EN) project page
 │   └── assets/                    # Images and videos used by the page
+├── data/
+│   └── agent mesh models.zip      # STL vehicle / pedestrian mesh library
 ├── requirements.txt
 ├── pyproject.toml
 ├── README.md
@@ -119,8 +121,9 @@ and the TraCI Python package:
 pip install eclipse-sumo
 ```
 
-> The STL vehicle mesh library is **not** bundled with this repository. Place your
-> `agent mesh models/` folder next to `src/` or pass its path with `--models-dir`.
+> The STL vehicle mesh library is distributed as `data/agent mesh models.zip`.
+> Extract it to an `agent mesh models/` folder (for example next to `src/`) and pass
+> that path with `--models-dir`.
 
 ## Data preparation
 
@@ -128,7 +131,7 @@ pip install eclipse-sumo
 |---|---|---|
 | Traffic trajectories | Vissim `.txt` (15 columns) or SUMO FCD `.xml` | Loaded by `lidarsim.trajectory` |
 | Environment point cloud | `.ply` (x/y/z, optional RGB/semantic) or `.h5` | Optional; `net.xml` can generate road-surface points |
-| Vehicle meshes | `.stl` / `.ply` / `.obj` | One mesh per vehicle class or vType |
+| Vehicle meshes | `.stl` / `.ply` / `.obj` | Bundled in `data/agent mesh models.zip`; one mesh per vehicle class or vType |
 | SUMO scenario | `.sumocfg` + `net.xml` | Required only for co-simulation |
 
 All paths are passed explicitly on the command line or through the GUI, so no global
